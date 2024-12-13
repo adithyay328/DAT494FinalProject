@@ -1,0 +1,192 @@
+import random
+
+import matplotlib.pyplot as plt
+
+import wandb
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+
+from cifar import *
+
+nz = 100 # Size of latent space, possibly with class concated
+ngf = 64 # Size of feature maps in generator
+ndf = 128 # Size of feature maps in discriminator
+nc = 3 # Number of channels in our input
+
+class Generator(nn.Module):
+  def __init__(self):
+    super(Generator, self).__init__()
+    self.main = nn.Sequential(
+   
+      # input is Z, going into a convolution
+      nn.ConvTranspose2d( nz, ngf * 8, 4, 1, 0, bias=False),
+      # nn.BatchNorm2d(ngf * 8),
+      nn.ReLU(True),
+      # state size. ``(ngf*8) x 4 x 4``
+      nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
+      nn.BatchNorm2d(ngf * 4),
+      nn.ReLU(True),
+      # state size. ``(ngf*4) x 8 x 8``
+      nn.ConvTranspose2d( ngf * 4, ngf * 2, 4, 2, 1, bias=False),
+      nn.BatchNorm2d(ngf * 2),
+      nn.ReLU(True),
+      # state size. ``(ngf*2) x 16 x 16``
+      nn.ConvTranspose2d( ngf * 2, ngf, 4, 2, 1, bias=False),
+      nn.BatchNorm2d(ngf),
+      nn.ReLU(True),
+      # state size. ``(ngf) x 32 x 32``
+      nn.Conv2d(ngf, 3, 1),
+      nn.Tanh()
+      # state size. ``(nc) x 64 x 64``
+    )
+
+  def forward(self, input):
+    return self.main(input)
+
+class Discriminator(nn.Module):
+  def __init__(self):
+    super(Discriminator, self).__init__()
+    self.main = nn.Sequential(
+        nn.Conv2d(nc, ndf * 2, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(ndf * 2),
+        nn.LeakyReLU(0.2, inplace=True),
+        # state size. ``(ndf*2) x 16 x 16``
+        nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(ndf * 4),
+        nn.LeakyReLU(0.2, inplace=True),
+        # state size. ``(ndf*4) x 8 x 8``
+        nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(ndf * 8),
+        nn.LeakyReLU(0.2, inplace=True),
+        # state size. ``(ndf*8) x 4 x 4``
+        nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
+        nn.Sigmoid()
+      )
+
+  def forward(self, input):
+    return self.main(input)
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+# Test if it works
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+rand = torch.randn(1, nz, 1, 1).to(device)
+gen = Generator().to(device)
+disc = Discriminator().to(device)
+
+weights_init(gen)
+weights_init(disc)
+
+print ( gen(rand).shape )
+print ( disc(gen(rand)).shape )
+
+if __name__ == "__main__":
+  hypers = {
+      "lr": 0.0002,
+      "architecture": "DCGAN, Unconditional",
+      "dataset": "CIFAR-10",
+      "epochs": 200,
+      "BS" : 256
+  }
+
+  # Now, our train loop. Train discriminator first,
+  # the generator.
+  genOptim = optim.Adam(gen.parameters(), lr=hypers["lr"], betas=(0.5, 0.999))
+  discOptim = optim.Adam(disc.parameters(), lr=hypers["lr"], betas=(0.5, 0.999))
+
+  wandb.init(
+    project="494Final",
+    config=hypers
+  )
+
+  BS = hypers["BS"]
+  trainLoader = cifarTrainset ( BS )
+  
+  realLabel = 1
+  fakeLabel = 0
+  
+  import os
+  
+  for epoch in range(hypers["epochs"]):
+    currEpochDiscriminatorAcc = []
+    currEpochGeneratorAcc = []
+
+    for x, y in trainLoader:
+      # Zero out both grads
+      genOptim.zero_grad()
+      discOptim.zero_grad()
+  
+      # Train discriminator with all-reals
+      realDiscPreds = disc(x.to(device) * 2 - 1)
+      realGT = torch.ones_like(realDiscPreds).to(device) * realLabel
+      loss = torch.nn.functional.binary_cross_entropy(realDiscPreds, realGT)
+      correctTensor_DiscReal = ( realDiscPreds.round() == realGT.float() ).float()
+      loss.backward()
+  
+      rand = torch.randn(BS, nz, 1, 1, device=device)
+  
+      fakeDiscPreds = disc(gen(rand).detach())
+      fakeGT = torch.ones_like(fakeDiscPreds).to(device) * fakeLabel
+      loss = torch.nn.functional.binary_cross_entropy(fakeDiscPreds, fakeGT)
+      correctTensor_DiscFake = ( fakeDiscPreds.round() == fakeGT.float() ).float()
+      loss.backward()
+  
+      discOptim.step()
+
+      # To compute average accuracy this iteration,
+      # concatenate the two tensors, then take the mean
+      currBatchDiscriminatorAcc = torch.mean(torch.cat([correctTensor_DiscReal, correctTensor_DiscFake]))
+
+      currEpochDiscriminatorAcc.append( currBatchDiscriminatorAcc.item() )
+  
+      # Now, generator
+      genOptim.zero_grad()
+      discOptim.zero_grad()
+  
+      newRand = torch.randn(BS, nz, 1, 1, device=device)
+      discPred = disc(gen(newRand))
+
+      generatorFoolRate = torch.mean( (discPred.round() == realLabel).float() ).item()
+      currEpochGeneratorAcc.append(generatorFoolRate)
+  
+      loss = -1 * torch.log(discPred).mean()
+      loss.backward()
+  
+      genOptim.step()
+
+    # Make 4 images, and log to wandb
+    fourRands = torch.randn(4, nz, 1, 1, device=device)
+    generated = gen(fourRands)
+    # Pemute to shape Batch, ..., channels
+    generated = generated.cpu().permute(0, 2, 3, 1).numpy(force=True)
+
+    asListOfImages = [ wandb.Image( img ) for img in generated ]
+
+    wandb.log({
+      "discriminator_accuracy": torch.mean(torch.tensor(currEpochDiscriminatorAcc)).item(),
+      "generator_accuracy": torch.mean(torch.tensor(currEpochGeneratorAcc)).item(),
+      "generated_images" : asListOfImages
+    })
+
+  # Save both models, then log to wandb using an
+  # artifact
+  artifact = wandb.Artifact('models', type='model')
+
+  torch.save(gen.state_dict(), "uncond_generator.pth")
+  torch.save(disc.state_dict(), "uncond_discriminator.pth")
+
+  artifact.add_file( local_path="uncond_generator.pth", name="Generator")
+  artifact.add_file( local_path="uncond_discriminator.pth", name="Discriminator")
+  artifact.save()
