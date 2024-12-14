@@ -1,4 +1,5 @@
 import random
+import os
 
 import matplotlib.pyplot as plt
 
@@ -11,7 +12,10 @@ import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 
+from torchmetrics.image.fid import FrechetInceptionDistance
+
 from cifar import *
+from fid import fid, featModel
 
 nz = 100 # Size of latent space, possibly with class concated
 ngf = 64 # Size of feature maps in generator
@@ -46,6 +50,11 @@ class Generator(nn.Module):
     )
 
   def forward(self, input):
+    # If input is less than 4 long,
+    # unsqueeze last dims
+    while len(input.shape) < 4:
+      input = input.unsqueeze(-1)
+
     return self.main(input)
 
 class Discriminator(nn.Module):
@@ -54,14 +63,17 @@ class Discriminator(nn.Module):
     self.main = nn.Sequential(
         nn.Conv2d(nc, ndf * 2, 4, 2, 1, bias=False),
         nn.BatchNorm2d(ndf * 2),
+        nn.Dropout(0.4),
         nn.LeakyReLU(0.2, inplace=True),
         # state size. ``(ndf*2) x 16 x 16``
         nn.Conv2d(ndf * 2, ndf * 4, 4, 2, 1, bias=False),
         nn.BatchNorm2d(ndf * 4),
+        nn.Dropout(0.4),
         nn.LeakyReLU(0.2, inplace=True),
         # state size. ``(ndf*4) x 8 x 8``
         nn.Conv2d(ndf * 4, ndf * 8, 4, 2, 1, bias=False),
         nn.BatchNorm2d(ndf * 8),
+        nn.Dropout(0.4),
         nn.LeakyReLU(0.2, inplace=True),
         # state size. ``(ndf*8) x 4 x 4``
         nn.Conv2d(ndf * 8, 1, 4, 1, 0, bias=False),
@@ -82,7 +94,7 @@ def weights_init(m):
 # Test if it works
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-rand = torch.randn(1, nz, 1, 1).to(device)
+rand = torch.randn(1, nz).to(device)
 gen = Generator().to(device)
 disc = Discriminator().to(device)
 
@@ -92,19 +104,24 @@ weights_init(disc)
 print ( gen(rand).shape )
 print ( disc(gen(rand)).shape )
 
+# if "uncond_generator.pth" in os.listdir():
+#   gen.load_state_dict(torch.load("uncond_generator.pth"))
+# if "uncond_discriminator.pth" in os.listdir():
+#   disc.load_state_dict(torch.load("uncond_discriminator.pth"))
+
 if __name__ == "__main__":
   hypers = {
       "lr": 0.0002,
       "architecture": "DCGAN, Unconditional",
       "dataset": "CIFAR-10",
-      "epochs": 200,
+      "epochs": 100,
       "BS" : 256
   }
 
   # Now, our train loop. Train discriminator first,
   # the generator.
   genOptim = optim.Adam(gen.parameters(), lr=hypers["lr"], betas=(0.5, 0.999))
-  discOptim = optim.Adam(disc.parameters(), lr=hypers["lr"], betas=(0.5, 0.999))
+  discOptim = optim.Adam(disc.parameters(), lr=hypers["lr"] / 4, betas=(0.5, 0.999))
 
   wandb.init(
     project="494Final",
@@ -118,7 +135,7 @@ if __name__ == "__main__":
   fakeLabel = 0
   
   import os
-  
+
   for epoch in range(hypers["epochs"]):
     currEpochDiscriminatorAcc = []
     currEpochGeneratorAcc = []
@@ -134,6 +151,8 @@ if __name__ == "__main__":
       loss = torch.nn.functional.binary_cross_entropy(realDiscPreds, realGT)
       correctTensor_DiscReal = ( realDiscPreds.round() == realGT.float() ).float()
       loss.backward()
+
+      oldLoss = loss
   
       rand = torch.randn(BS, nz, 1, 1, device=device)
   
@@ -142,6 +161,10 @@ if __name__ == "__main__":
       loss = torch.nn.functional.binary_cross_entropy(fakeDiscPreds, fakeGT)
       correctTensor_DiscFake = ( fakeDiscPreds.round() == fakeGT.float() ).float()
       loss.backward()
+
+      newLoss = loss
+
+      print(f"Total discriminator loss: { 1/2 * (oldLoss + newLoss) }")
   
       discOptim.step()
 
@@ -163,6 +186,8 @@ if __name__ == "__main__":
   
       loss = -1 * torch.log(discPred).mean()
       loss.backward()
+
+      print(f"Generator loss: {loss.item()}")
   
       genOptim.step()
 
@@ -174,10 +199,21 @@ if __name__ == "__main__":
 
     asListOfImages = [ wandb.Image( img ) for img in generated ]
 
+    # Also, generate 2000 images, and compute FID
+    fid.reset()
+    with torch.no_grad():
+      for i in range(8):
+        rands = torch.randn(256, nz, device=device)
+        gens = gen(rands)
+        fid.update(gens, real = False)
+
+    fidVal = fid.compute()
+
     wandb.log({
       "discriminator_accuracy": torch.mean(torch.tensor(currEpochDiscriminatorAcc)).item(),
       "generator_accuracy": torch.mean(torch.tensor(currEpochGeneratorAcc)).item(),
-      "generated_images" : asListOfImages
+      "generated_images" : asListOfImages,
+      "fid" : fidVal
     })
 
   # Save both models, then log to wandb using an
@@ -190,3 +226,24 @@ if __name__ == "__main__":
   artifact.add_file( local_path="uncond_generator.pth", name="Generator")
   artifact.add_file( local_path="uncond_discriminator.pth", name="Discriminator")
   artifact.save()
+
+# # Import FID, and compute
+# def genFunction():
+#   """
+#   Generate 256 samples at a time
+#   """
+#   randZ = torch.randn(256, nz, 1, 1, device=device)
+#   generated = gen(randZ)
+# 
+#   return generated
+# 
+# # 
+# # fid.computeFID_Uncond ( genFunction )
+# 
+# # Make 2048 samples
+# with torch.no_grad():
+#   for i in range(40):
+#     samples = genFunction() / 2 + 0.5
+#     fid.update ( samples, real = False)
+# 
+# print ( fid.compute() )
